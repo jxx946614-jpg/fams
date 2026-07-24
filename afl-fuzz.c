@@ -37,18 +37,21 @@
 #endif
 #define _FILE_OFFSET_BITS 64
 
-#include "fams.h"
 #include "config.h"
 #include "types.h"
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
+#include "flp.h"
+#include "queue_entry_flp.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 #include <errno.h>
 #include <signal.h>
 #include <dirent.h>
@@ -90,7 +93,6 @@
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
-
 
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
@@ -168,10 +170,10 @@ EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            queued_at_start,           /* Total number of initial inputs   */
            queued_discovered,         /* Items discovered during this run */
            queued_imported,           /* Items imported via -S            */
-           queued_favored,            /* Paths deemed favorable           */
+           
            queued_with_cov,           /* Paths with new coverage bytes    */
            pending_not_fuzzed,        /* Queued but not done yet          */
-           pending_favored,           /* Pending favored paths            */
+ 
            cur_skipped_paths,         /* Abandoned inputs in cur cycle    */
            cur_depth,                 /* Current path depth               */
            max_depth,                 /* Max path depth                   */
@@ -239,34 +241,11 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
-struct queue_entry {
-
-  u8* fname;                          /* File name for the test case      */
-  u32 len;                            /* Input length                     */
-
-  u8  cal_failed,                     /* Calibration failed?              */
-      trim_done,                      /* Trimmed?                         */
-      was_fuzzed,                     /* Had any fuzzing done yet?        */
-      passed_det,                     /* Deterministic stages passed?     */
-      has_new_cov,                    /* Triggers new coverage?           */
-      var_behavior,                   /* Variable behavior?               */
-      favored,                        /* Currently favored?               */
-      fs_redundant;                   /* Marked as redundant in the fs?   */
-
-  u32 bitmap_size,                    /* Number of bits set in bitmap     */
-      exec_cksum;                     /* Checksum of the execution trace  */
-
-  u64 exec_us,                        /* Execution time (us)              */
-      handicap,                       /* Number of queue cycles behind    */
-      depth;                          /* Path depth                       */
-
-  u8* trace_mini;                     /* Trace bytes, if kept             */
-  u32 tc_ref;                         /* Trace bytes ref count            */
-
-  struct queue_entry *next,           /* Next element, if any             */
-                     *next_100;       /* 100 elements ahead               */
-
-};
+static u8 flp_enabled = 1;
+u32 flp_learning_depth = 0;
+static struct queue_entry* flp_last_new_q = NULL;
+u32 queued_favored = 0;
+u32 pending_favored = 0;
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
@@ -806,27 +785,87 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
-  q->fname        = fname;
-  q->len          = len;
-  q->depth        = cur_depth + 1;
-  q->passed_det   = passed_det;
+  /* Zero-initialise everything first; flp fields that need non-zero
+     defaults are set explicitly below.  Fields that carry parent-
+     propagated data (flp_lineage_score, flp_success_credit) are left
+     at 0 here and written by flp_reward_parent_ancestor() in
+     save_if_interesting() after this function returns.               */
+  memset(q, 0, sizeof(*q));
 
-  if (q->depth > max_depth) max_depth = q->depth;
+  /* ── AFL core fields ─────────────────────────────────────────── */
+  q->fname      = fname;
+  q->len        = len;
+  q->depth      = cur_depth + 1;
+  q->passed_det = passed_det;
+
+  q->next     = NULL;
+  q->next_100 = NULL;
+
+  /* ── FLP identity ─────────────────────────────────────────────── */
+  q->flp_magic  = FLP_QUEUE_MAGIC;
+  q->flp_parent = NULL;       /* set by save_if_interesting()        */
+  q->flp_lineage_id = 0;
+  q->flp_depth      = 0;
+
+  /* ── Coverage geometry (computed by flp_compute_seed_score) ──── */
+  q->flp_path_edges     = 0;
+  q->flp_frontier_edges = 0;
+
+  q->flp_density  = 0.0;
+  q->flp_rarity   = 0.0;
+  q->flp_recency  = 0.0;
+  q->flp_sparsity = 0.0;
+
+  q->flp_frontier_score      = 0.0;
+  q->flp_base_frontier_score = 0.0;
+  q->flp_frontier_potential  = 0.0;
+
+  q->flp_multiplier     = 1.0;
+  q->flp_adaptive_boost = 1.0;
+
+  q->flp_lineage_score  = 0.0;
+  q->flp_success_credit = 0.0;
+
+  /* ── Score bookkeeping ────────────────────────────────────────── */
+  q->flp_selection_score = 0.0;
+
+  q->flp_last_lineage_exec   = 0;
+  q->flp_last_success_exec   = 0;
+  q->flp_last_recompute_exec = 0;
+  q->flp_score_epoch         = 0;
+
+  /* ── Execution / child stats ──────────────────────────────────── */
+  q->flp_new_edges_found      = 0;   /* edge_bonus source in compute_seed_score */
+  q->flp_child_finds          = 0;
+  q->flp_frontier_child_finds = 0;
+  q->flp_times_fuzzed         = 0;
+
+  /* ── Misc flags ───────────────────────────────────────────────── */
+  q->hits_frontier  = 0;
+  q->flp_preserved = 0;
+
+  /* ── AFL queue linkage ────────────────────────────────────────── */
+  if (q->depth > max_depth)
+    max_depth = q->depth;
 
   if (queue_top) {
 
     queue_top->next = q;
     queue_top = q;
 
-  } else q_prev100 = queue = queue_top = q;
+  } else {
+
+    q_prev100 = queue = queue_top = q;
+
+  }
 
   queued_paths++;
   pending_not_fuzzed++;
 
   cycles_wo_finds = 0;
 
-  /* Set next_100 pointer for every 100th element (index 0, 100, etc) to allow faster iteration. */
-  if ((queued_paths - 1) % 100 == 0 && queued_paths > 1) {
+  if ((queued_paths - 1) % 100 == 0 &&
+      queued_paths > 1) {
 
     q_prev100->next_100 = q;
     q_prev100 = q;
@@ -836,7 +875,6 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   last_path_time = get_cur_time();
 
 }
-
 
 /* Destroy the entire queue. */
 
@@ -1266,47 +1304,69 @@ static void minimize_bits(u8* dst, u8* src) {
 static void update_bitmap_score(struct queue_entry* q) {
 
   u32 i;
-  u64 fav_factor = q->exec_us * q->len;
+  u64 fav_factor;
 
-  /* For every byte set in trace_bits[], see if there is a previous winner,
-     and how it compares to us. */
+  if (!q) return;
 
-  for (i = 0; i < MAP_SIZE; i++)
+  if (q->exec_us && q->len && q->exec_us > ULLONG_MAX / q->len)
+    fav_factor = ULLONG_MAX;
+  else
+    fav_factor = (u64)q->exec_us * q->len;
 
-    if (trace_bits[i]) {
+  if (!fav_factor)
+    fav_factor = 1;
 
-       if (top_rated[i]) {
+  for (i = 0; i < MAP_SIZE; i++) {
 
-         /* Faster-executing or smaller test cases are favored. */
+    if (!trace_bits[i])
+      continue;
 
-         if (fav_factor > top_rated[i]->exec_us * top_rated[i]->len) continue;
+    if (top_rated[i]) {
 
-         /* Looks like we're going to win. Decrease ref count for the
-            previous winner, discard its trace_bits[] if necessary. */
+      u64 old_factor;
 
-         if (!--top_rated[i]->tc_ref) {
-           ck_free(top_rated[i]->trace_mini);
-           top_rated[i]->trace_mini = 0;
-         }
+      if (top_rated[i]->exec_us &&
+          top_rated[i]->len &&
+          top_rated[i]->exec_us > ULLONG_MAX / top_rated[i]->len)
+        old_factor = ULLONG_MAX;
+      else
+        old_factor = (u64)top_rated[i]->exec_us * top_rated[i]->len;
 
-       }
+      if (!old_factor)
+        old_factor = 1;
 
-       /* Insert ourselves as the new winner. */
+      if (fav_factor > old_factor)
+        continue;
 
-       top_rated[i] = q;
-       q->tc_ref++;
+      if (!--top_rated[i]->tc_ref) {
+        ck_free(top_rated[i]->trace_mini);
+        top_rated[i]->trace_mini = 0;
+      }
 
-       if (!q->trace_mini) {
-         q->trace_mini = ck_alloc(MAP_SIZE >> 3);
-         minimize_bits(q->trace_mini, trace_bits);
-       }
+      top_rated[i] = q;
+      q->tc_ref++;
 
-       score_changed = 1;
+      if (!q->trace_mini) {
+        q->trace_mini = ck_alloc(MAP_SIZE >> 3);
+        minimize_bits(q->trace_mini, trace_bits);
+      }
 
-     }
+      score_changed = 1;
 
+    } else {
+
+      top_rated[i] = q;
+      q->tc_ref++;
+
+      if (!q->trace_mini) {
+        q->trace_mini = ck_alloc(MAP_SIZE >> 3);
+        minimize_bits(q->trace_mini, trace_bits);
+      }
+
+      score_changed = 1;
+    }
+  }
 }
-
 
 /* The second part of the mechanism discussed above is a routine that
    goes over top_rated[] entries, and then sequentially grabs winners for
@@ -1329,40 +1389,59 @@ static void cull_queue(void) {
   queued_favored  = 0;
   pending_favored = 0;
 
-  q = queue;
-
-  while (q) {
-    q->favored = 0;
-    q = q->next;
+  for (q = queue; q; q = q->next) {
+    q->favored        = 0;
+    q->flp_preserved = 0;
   }
 
-  /* Let's see if anything in the bitmap isn't captured in temp_v.
-     If yes, and if it has a top_rated[] contender, let's use it. */
+  /* ── Phase 1: AFL bitmap-based favored selection (always runs) ── */
 
-  for (i = 0; i < MAP_SIZE; i++)
-    if (top_rated[i] && (temp_v[i >> 3] & (1 << (i & 7)))) {
+  for (i = 0; i < MAP_SIZE; i++) {
 
-      u32 j = MAP_SIZE >> 3;
+    if (!top_rated[i] ||
+        !top_rated[i]->trace_mini ||
+        !(temp_v[i >> 3] & (1 << (i & 7))))
+      continue;
 
-      /* Remove all bits belonging to the current entry from temp_v. */
+    u32 j = MAP_SIZE >> 3;
 
-      while (j--) 
-        if (top_rated[i]->trace_mini[j])
-          temp_v[j] &= ~top_rated[i]->trace_mini[j];
+    while (j--) {
+      if (top_rated[i]->trace_mini[j])
+        temp_v[j] &= ~top_rated[i]->trace_mini[j];
+    }
 
+    if (!top_rated[i]->favored) {
       top_rated[i]->favored = 1;
       queued_favored++;
 
-      if (!top_rated[i]->was_fuzzed) pending_favored++;
-
+      if (!top_rated[i]->was_fuzzed)
+        pending_favored++;
     }
-
-  q = queue;
-
-  while (q) {
-    mark_as_redundant(q, !q->favored);
-    q = q->next;
   }
+
+  /* ── Phase 2: FLP Top-K favored override ─────────────────────── */
+
+  if (flp_enabled) {
+
+#if FLP_USE_TOPK
+    flp_preserve_topk();
+#endif
+
+    /* Recount favored after Top-K may have promoted additional seeds. */
+    queued_favored  = 0;
+    pending_favored = 0;
+
+    for (q = queue; q; q = q->next) {
+      if (q->favored) {
+        queued_favored++;
+        if (!q->was_fuzzed)
+          pending_favored++;
+      }
+    }
+  }
+
+  for (q = queue; q; q = q->next)
+    mark_as_redundant(q, !q->favored);
 
 }
 
@@ -2773,26 +2852,38 @@ static void perform_dry_run(char** argv) {
     if (stop_soon) return;
 
     if (res == crash_mode || res == FAULT_NOBITS)
-      SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST, 
+      SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST,
            q->len, q->bitmap_size, q->exec_us);
 
     switch (res) {
 
-      case FAULT_NONE:
+      case FAULT_NONE: {
 
         if (q == queue) check_map_coverage();
 
-        if (crash_mode) FATAL("Test case '%s' does *NOT* crash", fn);
+        if (crash_mode)
+          FATAL("Test case '%s' does *NOT* crash", fn);
+
+        if (flp_enabled && !q->cal_failed) {
+        
+          u64 flp_exec = total_execs;
+
+          q->flp_lineage_id = flp_create_lineage(0);
+
+          flp_on_new_seed(q, trace_bits, flp_exec);
+
+          q->hits_frontier =(q->flp_frontier_edges > 0 || q->flp_frontier_score > 0.0);
+
+          flp_collect_active_edges();
+          flp_update_edge_stats(flp_exec);
+        }
 
         break;
+      }
 
       case FAULT_TMOUT:
 
         if (timeout_given) {
-
-          /* The -t nn+ syntax in the command line sets timeout_given to '2' and
-             instructs afl-fuzz to tolerate but skip queue entries that time
-             out. */
 
           if (timeout_given > 1) {
             WARNF("Test case results in a timeout (skipping)");
@@ -2806,8 +2897,8 @@ static void perform_dry_run(char** argv) {
                "    Usually, the right thing to do is to relax the -t option - or to delete it\n"
                "    altogether and allow the fuzzer to auto-calibrate. That said, if you know\n"
                "    what you are doing and want to simply skip the unruly test cases, append\n"
-               "    '+' at the end of the value passed to -t ('-t %u+').\n", exec_tmout,
-               exec_tmout);
+               "    '+' at the end of the value passed to -t ('-t %u+').\n",
+               exec_tmout, exec_tmout);
 
           FATAL("Test case '%s' results in a timeout", fn);
 
@@ -2817,83 +2908,23 @@ static void perform_dry_run(char** argv) {
                "The program took more than %u ms to process one of the initial test cases.\n"
                "    This is bad news; raising the limit with the -t option is possible, but\n"
                "    will probably make the fuzzing process extremely slow.\n\n"
-
                "    If this test case is just a fluke, the other option is to just avoid it\n"
-               "    altogether, and find one that is less of a CPU hog.\n", exec_tmout);
+               "    altogether, and find one that is less of a CPU hog.\n",
+               exec_tmout);
 
           FATAL("Test case '%s' results in a timeout", fn);
-
         }
 
-      case FAULT_CRASH:  
+      case FAULT_CRASH:
 
-        if (crash_mode) break;
+        if (crash_mode)
+          break;
 
         if (skip_crashes) {
           WARNF("Test case results in a crash (skipping)");
           q->cal_failed = CAL_CHANCES;
           cal_failures++;
           break;
-        }
-
-        if (mem_limit) {
-
-          SAYF("\n" cLRD "[-] " cRST
-               "Oops, the program crashed with one of the test cases provided. There are\n"
-               "    several possible explanations:\n\n"
-
-               "    - The test case causes known crashes under normal working conditions. If\n"
-               "      so, please remove it. The fuzzer should be seeded with interesting\n"
-               "      inputs - but not ones that cause an outright crash.\n\n"
-
-               "    - The current memory limit (%s) is too low for this program, causing\n"
-               "      it to die due to OOM when parsing valid files. To fix this, try\n"
-               "      bumping it up with the -m setting in the command line. If in doubt,\n"
-               "      try something along the lines of:\n\n"
-
-#ifdef RLIMIT_AS
-               "      ( ulimit -Sv $[%llu << 10]; /path/to/binary [...] <testcase )\n\n"
-#else
-               "      ( ulimit -Sd $[%llu << 10]; /path/to/binary [...] <testcase )\n\n"
-#endif /* ^RLIMIT_AS */
-
-               "      Tip: you can use http://jwilk.net/software/recidivm to quickly\n"
-               "      estimate the required amount of virtual memory for the binary. Also,\n"
-               "      if you are using ASAN, see %s/notes_for_asan.txt.\n\n"
-
-#ifdef __APPLE__
-  
-               "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
-               "      break afl-fuzz performance optimizations when running platform-specific\n"
-               "      binaries. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
-
-#endif /* __APPLE__ */
-
-               "    - Least likely, there is a horrible bug in the fuzzer. If other options\n"
-               "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n",
-               DMS(mem_limit << 20), mem_limit - 1, doc_path);
-
-        } else {
-
-          SAYF("\n" cLRD "[-] " cRST
-               "Oops, the program crashed with one of the test cases provided. There are\n"
-               "    several possible explanations:\n\n"
-
-               "    - The test case causes known crashes under normal working conditions. If\n"
-               "      so, please remove it. The fuzzer should be seeded with interesting\n"
-               "      inputs - but not ones that cause an outright crash.\n\n"
-
-#ifdef __APPLE__
-  
-               "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
-               "      break afl-fuzz performance optimizations when running platform-specific\n"
-               "      binaries. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
-
-#endif /* __APPLE__ */
-
-               "    - Least likely, there is a horrible bug in the fuzzer. If other options\n"
-               "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n");
-
         }
 
         FATAL("Test case '%s' results in a crash", fn);
@@ -2906,7 +2937,7 @@ static void perform_dry_run(char** argv) {
 
         FATAL("No instrumentation detected");
 
-      case FAULT_NOBITS: 
+      case FAULT_NOBITS:
 
         useless_at_start++;
 
@@ -2914,13 +2945,12 @@ static void perform_dry_run(char** argv) {
           WARNF("No new instrumentation output, test case may be useless.");
 
         break;
-
     }
 
-    if (q->var_behavior) WARNF("Instrumentation output varies across runs.");
+    if (q->var_behavior)
+      WARNF("Instrumentation output varies across runs.");
 
     q = q->next;
-
   }
 
   if (cal_failures) {
@@ -2929,19 +2959,17 @@ static void perform_dry_run(char** argv) {
       FATAL("All test cases time out%s, giving up!",
             skip_crashes ? " or crash" : "");
 
-    WARNF("Skipped %u test cases (%0.02f%%) due to timeouts%s.", cal_failures,
+    WARNF("Skipped %u test cases (%0.02f%%) due to timeouts%s.",
+          cal_failures,
           ((double)cal_failures) * 100 / queued_paths,
           skip_crashes ? " or crashes" : "");
 
     if (cal_failures * 5 > queued_paths)
       WARNF(cLRD "High percentage of rejected test cases, check settings!");
-
   }
 
   OKF("All test cases processed.");
-
 }
-
 
 /* Helper function: link() if possible, copy otherwise. */
 
@@ -3164,187 +3192,192 @@ static void write_crash_readme(void) {
 static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   u8  *fn = "";
-  u8  hnb;
+  u8  hnb = 0;
   s32 fd;
   u8  keeping = 0, res;
 
+  struct queue_entry* flp_parent = queue_cur;
+
+  if (flp_enabled)
+    flp_last_new_q = NULL;
+
   if (fault == crash_mode) {
 
-    /* Keep only if there are new bits in the map, add to queue for
-       future fuzzing, etc. */
+    hnb = has_new_bits(virgin_bits);
 
-    if (!(hnb = has_new_bits(virgin_bits))) {
+    if (!hnb) {
       if (crash_mode) total_crashes++;
       return 0;
-    }    
+    }
 
 #ifndef SIMPLE_FILES
-
-    fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,
-                      describe_op(hnb));
-
+    fn = alloc_printf("%s/queue/id:%06u,%s", out_dir,
+                      queued_paths, describe_op(hnb));
 #else
-
     fn = alloc_printf("%s/queue/id_%06u", out_dir, queued_paths);
-
-#endif /* ^!SIMPLE_FILES */
+#endif
 
     add_to_queue(fn, len, 0);
 
+    struct queue_entry* new_q = queue_top;
+    if (!new_q) FATAL("add_to_queue failed");
+
+    if (flp_enabled) {
+
+      flp_last_new_q = new_q;
+      
+      if (flp_parent && flp_parent != new_q && flp_parent->flp_magic == FLP_QUEUE_MAGIC && flp_parent->flp_lineage_id) {
+
+        new_q->flp_parent = flp_parent;
+        new_q->flp_depth = flp_parent->flp_depth + 1;
+        if (hnb == 2) {
+          /* New coverage byte: open a new lineage branch. */
+          u32 branch = flp_create_lineage(flp_parent->flp_lineage_id);
+          new_q->flp_lineage_id = branch ? branch : flp_parent->flp_lineage_id;
+        } else {
+          /* Inherit parent lineage — same exploratory thread. */
+          new_q->flp_lineage_id = flp_parent->flp_lineage_id;
+        }
+
+      } else {
+
+        new_q->flp_parent = NULL;
+        new_q->flp_depth = 0;
+        u32 root = flp_create_lineage(0);
+        new_q->flp_lineage_id = root ? root : 0;
+      }
+    }
+
     if (hnb == 2) {
-      queue_top->has_new_cov = 1;
+      new_q->has_new_cov = 1;
       queued_with_cov++;
     }
 
-    queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+    new_q->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
-    /* Try to calibrate inline; this also calls update_bitmap_score() when
-       successful. */
-
-    res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
+    res = calibrate_case(argv, new_q, mem, queue_cycle - 1, 0);
 
     if (res == FAULT_ERROR)
       FATAL("Unable to execute target application");
 
     fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) PFATAL("Unable to create '%s'", fn);
+
     ck_write(fd, mem, len, fn);
     close(fd);
 
-    keeping = 1;
+    if (flp_enabled) {
+    
+      u64 flp_exec = total_execs;   /* always >= 1 after calibrate_case */
 
+      flp_on_new_seed(new_q, trace_bits, flp_exec);
+
+      new_q->hits_frontier = (hnb == 2) || (new_q->flp_frontier_edges > 0);
+
+#ifndef FLP_DISABLE_LINEAGE
+      if (new_q->flp_lineage_id)
+        flp_reward_lineage(new_q->flp_lineage_id, new_q, hnb, flp_exec);
+
+      if (new_q->flp_parent)
+        flp_reward_parent_ancestor(new_q->flp_parent, new_q, hnb, flp_exec);
+#endif
+
+      flp_collect_active_edges();
+      flp_update_edge_stats(flp_exec);
+    }
+
+    keeping = 1;
   }
 
   switch (fault) {
 
     case FAULT_TMOUT:
-
-      /* Timeouts are not very interesting, but we're still obliged to keep
-         a handful of samples. We use the presence of new bits in the
-         hang-specific bitmap as a signal of uniqueness. In "dumb" mode, we
-         just keep everything. */
-
       total_tmouts++;
-
       if (unique_hangs >= KEEP_UNIQUE_HANG) return keeping;
 
       if (!dumb_mode) {
-
 #ifdef WORD_SIZE_64
         simplify_trace((u64*)trace_bits);
 #else
         simplify_trace((u32*)trace_bits);
-#endif /* ^WORD_SIZE_64 */
-
+#endif
         if (!has_new_bits(virgin_tmout)) return keeping;
-
       }
 
       unique_tmouts++;
 
-      /* Before saving, we make sure that it's a genuine hang by re-running
-         the target with a more generous timeout (unless the default timeout
-         is already generous). */
-
       if (exec_tmout < hang_tmout) {
 
         u8 new_fault;
+
         write_to_testcase(mem, len);
         new_fault = run_target(argv, hang_tmout);
 
-        /* A corner case that one user reported bumping into: increasing the
-           timeout actually uncovers a crash. Make sure we don't discard it if
-           so. */
-
         if (!stop_soon && new_fault == FAULT_CRASH) goto keep_as_crash;
-
         if (stop_soon || new_fault != FAULT_TMOUT) return keeping;
-
       }
 
 #ifndef SIMPLE_FILES
-
-      fn = alloc_printf("%s/hangs/id:%06llu,%s", out_dir,
-                        unique_hangs, describe_op(0));
-
+      fn = alloc_printf("%s/hangs/id:%06llu,%s",
+                        out_dir, unique_hangs, describe_op(0));
 #else
-
-      fn = alloc_printf("%s/hangs/id_%06llu", out_dir,
-                        unique_hangs);
-
-#endif /* ^!SIMPLE_FILES */
+      fn = alloc_printf("%s/hangs/id_%06llu", out_dir, unique_hangs);
+#endif
 
       unique_hangs++;
-
       last_hang_time = get_cur_time();
-
       break;
 
     case FAULT_CRASH:
 
 keep_as_crash:
 
-      /* This is handled in a manner roughly similar to timeouts,
-         except for slightly different limits and no need to re-run test
-         cases. */
-
       total_crashes++;
 
       if (unique_crashes >= KEEP_UNIQUE_CRASH) return keeping;
 
       if (!dumb_mode) {
-
 #ifdef WORD_SIZE_64
         simplify_trace((u64*)trace_bits);
 #else
         simplify_trace((u32*)trace_bits);
-#endif /* ^WORD_SIZE_64 */
-
+#endif
         if (!has_new_bits(virgin_crash)) return keeping;
-
       }
 
       if (!unique_crashes) write_crash_readme();
 
 #ifndef SIMPLE_FILES
-
-      fn = alloc_printf("%s/crashes/id:%06llu,sig:%02u,%s", out_dir,
-                        unique_crashes, kill_signal, describe_op(0));
-
+      fn = alloc_printf("%s/crashes/id:%06llu,sig:%02u,%s",
+                        out_dir, unique_crashes,
+                        kill_signal, describe_op(0));
 #else
-
-      fn = alloc_printf("%s/crashes/id_%06llu_%02u", out_dir, unique_crashes,
-                        kill_signal);
-
-#endif /* ^!SIMPLE_FILES */
+      fn = alloc_printf("%s/crashes/id_%06llu_%02u",
+                        out_dir, unique_crashes, kill_signal);
+#endif
 
       unique_crashes++;
-
       last_crash_time = get_cur_time();
       last_crash_execs = total_execs;
-
       break;
 
-    case FAULT_ERROR: FATAL("Unable to execute target application");
+    case FAULT_ERROR:
+      FATAL("Unable to execute target application");
 
-    default: return keeping;
-
+    default:
+      return keeping;
   }
-
-  /* If we're here, we apparently want to save the crash or hang
-     test case, too. */
 
   fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
   if (fd < 0) PFATAL("Unable to create '%s'", fn);
+
   ck_write(fd, mem, len, fn);
   close(fd);
 
   ck_free(fn);
 
   return keeping;
-
 }
-
 
 /* When resuming, try to find the queue position to start from. This makes sense
    only when resuming, and when we can find the original fuzzer_stats. */
@@ -3961,17 +3994,14 @@ static void show_stats(void) {
 
   } else {
 
-    double cur_avg = ((double)(total_execs - last_execs)) * 1000 /
-                     (cur_ms - last_ms);
+    double cur_avg = ((double)(total_execs - last_execs)) * 1000 / (cur_ms - last_ms);
 
-    /* If there is a dramatic (5x+) jump in speed, reset the indicator
-       more quickly. */
+    /* If there is a dramatic (5x+) jump in speed, reset the indicator more quickly. */
 
     if (cur_avg * 5 < avg_exec || cur_avg / 5 > avg_exec)
       avg_exec = cur_avg;
 
-    avg_exec = avg_exec * (1.0 - 1.0 / AVG_SMOOTHING) +
-               cur_avg * (1.0 / AVG_SMOOTHING);
+    avg_exec = avg_exec * (1.0 - 1.0 / AVG_SMOOTHING) + cur_avg * (1.0 / AVG_SMOOTHING);
 
   }
 
@@ -4015,8 +4045,7 @@ static void show_stats(void) {
 
   /* Honor AFL_EXIT_WHEN_DONE and AFL_BENCH_UNTIL_CRASH. */
 
-  if (!dumb_mode && cycles_wo_finds > 100 && !pending_not_fuzzed &&
-      getenv("AFL_EXIT_WHEN_DONE")) stop_soon = 2;
+  if (!dumb_mode && cycles_wo_finds > 100 && !pending_not_fuzzed && getenv("AFL_EXIT_WHEN_DONE")) stop_soon = 2;
 
   if (total_crashes && getenv("AFL_BENCH_UNTIL_CRASH")) stop_soon = 2;
 
@@ -4647,23 +4676,33 @@ abort_trimming:
 /* Write a modified test case, run program, process results. Handle
    error conditions, returning 1 if it's time to bail out. This is
    a helper function for fuzz_one(). */
-
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   u8 fault;
+  u8 new_path;
 
   if (post_handler) {
 
     out_buf = post_handler(out_buf, &len);
-    if (!out_buf || !len) return 0;
-
+    if (!out_buf || !len)
+      return 0;
   }
 
   write_to_testcase(out_buf, len);
-
   fault = run_target(argv, exec_tmout);
 
-  if (stop_soon) return 1;
+  /* Count this execution against the current seed only if calibration
+     succeeded — a cal_failed seed's fuzz count would otherwise inflate
+     its flp_times_fuzzed and corrupt energy estimates.                */
+  if (flp_enabled &&
+      queue_cur &&
+      queue_cur->flp_magic == FLP_QUEUE_MAGIC &&
+      !queue_cur->cal_failed) {
+    queue_cur->flp_times_fuzzed++;
+  }
+
+  if (stop_soon)
+    return 1;
 
   if (fault == FAULT_TMOUT) {
 
@@ -4674,74 +4713,27 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   } else subseq_tmouts = 0;
 
-  /* Users can hit us with SIGUSR1 to request the current input
-     to be abandoned. */
-
   if (skip_requested) {
-
-     skip_requested = 0;
-     cur_skipped_paths++;
-     return 1;
-
+    skip_requested = 0;
+    cur_skipped_paths++;
+    return 1;
   }
 
-  /* This handles FAULT_ERROR for us: */
+  new_path = save_if_interesting(argv, out_buf, len, fault);
+  queued_discovered += new_path;
 
-  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+  if (flp_enabled && !new_path && fault != FAULT_ERROR) {
 
-  if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
+    flp_collect_active_edges();
+    flp_update_edge_stats(total_execs);
+    flp_decay_edge_stats();
+  }
+
+  if ((total_execs % stats_update_freq) == 0)
     show_stats();
-  
-  fams_feedback();
-  fams_on_exec();
 
   return 0;
-
 }
-
-
-/* Helper to choose random block len for block operations in fuzz_one().
-   Doesn't return zero, provided that max_len is > 0. */
-
-static u32 choose_block_len(u32 limit) {
-
-  u32 min_value, max_value;
-  u32 rlim = MIN(queue_cycle, 3);
-
-  if (!run_over10m) rlim = 1;
-
-  switch (UR(rlim)) {
-
-    case 0:  min_value = 1;
-             max_value = HAVOC_BLK_SMALL;
-             break;
-
-    case 1:  min_value = HAVOC_BLK_SMALL;
-             max_value = HAVOC_BLK_MEDIUM;
-             break;
-
-    default: 
-
-             if (UR(10)) {
-
-               min_value = HAVOC_BLK_MEDIUM;
-               max_value = HAVOC_BLK_LARGE;
-
-             } else {
-
-               min_value = HAVOC_BLK_LARGE;
-               max_value = HAVOC_BLK_XL;
-
-             }
-
-  }
-
-  if (min_value >= limit) min_value = 1;
-
-  return min_value + UR(MIN(max_value, limit) - min_value + 1);
-
-}
-
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
@@ -4749,70 +4741,58 @@ static u32 choose_block_len(u32 limit) {
 
 static u32 calculate_score(struct queue_entry* q) {
 
-  u32 avg_exec_us = total_cal_us / total_cal_cycles;
-  u32 avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
-  u32 perf_score = 100;
+  u64 avg_exec_us = 1;
+  u64 avg_bitmap_size = 1;
+  double base = 100.0;
+  u32 perf_score;
 
-  /* Adjust score based on execution speed of this path, compared to the
-     global average. Multiplier ranges from 0.1x to 3x. Fast inputs are
-     less expensive to fuzz, so we're giving them more air time. */
+  if (total_cal_cycles)
+    avg_exec_us = total_cal_us / total_cal_cycles;
 
-  if (q->exec_us * 0.1 > avg_exec_us) perf_score = 10;
-  else if (q->exec_us * 0.25 > avg_exec_us) perf_score = 25;
-  else if (q->exec_us * 0.5 > avg_exec_us) perf_score = 50;
-  else if (q->exec_us * 0.75 > avg_exec_us) perf_score = 75;
-  else if (q->exec_us * 4 < avg_exec_us) perf_score = 300;
-  else if (q->exec_us * 3 < avg_exec_us) perf_score = 200;
-  else if (q->exec_us * 2 < avg_exec_us) perf_score = 150;
+  if (total_bitmap_entries)
+    avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
 
-  /* Adjust score based on bitmap size. The working theory is that better
-     coverage translates to better targets. Multiplier from 0.25x to 3x. */
+  /* ── AFL baseline energy model ───────────────────────────────────── *
+   * Keep the original AFL step-function factors so that the absolute   *
+   * magnitude of base stays predictable before FLP multiplies it.      *
+   * Continuous bmp_factor formulas interact badly with flp_mult_max   *
+   * and produce excess clamp collisions at the top of the score range. */
 
-  if (q->bitmap_size * 0.3 > avg_bitmap_size) perf_score *= 3;
-  else if (q->bitmap_size * 0.5 > avg_bitmap_size) perf_score *= 2;
-  else if (q->bitmap_size * 0.75 > avg_bitmap_size) perf_score *= 1.5;
-  else if (q->bitmap_size * 3 < avg_bitmap_size) perf_score *= 0.25;
-  else if (q->bitmap_size * 2 < avg_bitmap_size) perf_score *= 0.5;
-  else if (q->bitmap_size * 1.5 < avg_bitmap_size) perf_score *= 0.75;
+  if (avg_exec_us > 0) {
+    double exec_factor = (double)q->exec_us / (double)avg_exec_us;
 
-  /* Adjust score based on handicap. Handicap is proportional to how late
-     in the game we learned about this path. Latecomers are allowed to run
-     for a bit longer until they catch up with the rest. */
-
-  if (q->handicap >= 4) {
-
-    perf_score *= 4;
-    q->handicap -= 4;
-
-  } else if (q->handicap) {
-
-    perf_score *= 2;
-    q->handicap--;
-
+    if      (exec_factor > 4.0)  base *= 0.50;
+    else if (exec_factor > 2.0)  base *= 0.75;
+    else if (exec_factor < 0.25) base *= 2.00;
+    else if (exec_factor < 0.5)  base *= 1.50;
   }
 
-  /* Final adjustment based on input depth, under the assumption that fuzzing
-     deeper test cases is more likely to reveal stuff that can't be
-     discovered with traditional fuzzers. */
+  if (avg_bitmap_size > 0) {
+    double bmp_factor = (double)q->bitmap_size / (double)avg_bitmap_size;
 
-  switch (q->depth) {
-
-    case 0 ... 3:   break;
-    case 4 ... 7:   perf_score *= 2; break;
-    case 8 ... 13:  perf_score *= 3; break;
-    case 14 ... 25: perf_score *= 4; break;
-    default:        perf_score *= 5;
-
+    if      (bmp_factor > 3.0)  base *= 3.00;
+    else if (bmp_factor > 2.0)  base *= 2.00;
+    else if (bmp_factor > 1.5)  base *= 1.50;
+    else if (bmp_factor < 0.25) base *= 0.25;
+    else if (bmp_factor < 0.50) base *= 0.50;
+    else if (bmp_factor < 0.75) base *= 0.75;
   }
 
-  /* Make sure that we don't go over limit. */
+  if (flp_enabled) {
 
-  if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
+    double flp_mult = flp_apply_perf_score(q, (u32)base, total_execs, avg_exec_us, q->len);
+  }
+
+  if (base < 1.0)
+    base = 1.0;
+
+  if (base > (double)(HAVOC_MAX_MULT * 100))
+    base = (double)(HAVOC_MAX_MULT * 100);
+
+  perf_score = (u32)base;
 
   return perf_score;
-
 }
-
 
 /* Helper function to see if a particular change (xor_val = old ^ new) could
    be a product of deterministic bit flips with the lengths and stepovers
@@ -4999,7 +4979,6 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 }
 
-
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
    skipped or bailed out. */
@@ -5053,10 +5032,9 @@ static u8 fuzz_one(char** argv) {
   }
 
 #endif /* ^IGNORE_FINDS */
-
+  
   if (not_on_tty) {
-    ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
-         current_entry, queued_paths, unique_crashes);
+    ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...", current_entry, queued_paths, unique_crashes);
     fflush(stdout);
   }
 
@@ -5067,7 +5045,6 @@ static u8 fuzz_one(char** argv) {
   if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
 
   len = queue_cur->len;
-
   orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
   if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
@@ -5081,9 +5058,7 @@ static u8 fuzz_one(char** argv) {
   out_buf = ck_alloc_nozero(len);
 
   subseq_tmouts = 0;
-
   cur_depth = queue_cur->depth;
-
   /*******************************************
    * CALIBRATION (only if failed earlier on) *
    *******************************************/
@@ -5113,7 +5088,6 @@ static u8 fuzz_one(char** argv) {
     }
 
   }
-
   /************
    * TRIMMING *
    ************/
@@ -5133,18 +5107,13 @@ static u8 fuzz_one(char** argv) {
     /* Don't retry trimming, even if it failed. */
 
     queue_cur->trim_done = 1;
-
     if (len != queue_cur->len) len = queue_cur->len;
-
   }
-
   memcpy(out_buf, in_buf, len);
-
   /*********************
    * PERFORMANCE SCORE *
    *********************/
-
-  orig_perf = perf_score = calculate_score(queue_cur);
+  orig_perf = perf_score = calculate_score(queue_cur);       
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
@@ -6165,10 +6134,8 @@ havoc_stage:
     stage_cur_val = use_stacking;
  
     for (i = 0; i < use_stacking; i++) {
-      u32 mutator = fams_select_mutator(17);
-      fams_set_current_mutator(mutator);
 
-      switch (mutator) {
+      switch (UR(15 + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
 
         case 0:
 
@@ -6355,7 +6322,7 @@ havoc_stage:
 
             /* Don't delete too much. */
 
-            del_len = choose_block_len(temp_len - 1);
+            del_len = choose_block_len(temp_len - 1, queue_cur);
 
             del_from = UR(temp_len - del_len + 1);
 
@@ -6380,12 +6347,12 @@ havoc_stage:
 
             if (actually_clone) {
 
-              clone_len  = choose_block_len(temp_len);
+              clone_len  = choose_block_len(temp_len, queue_cur);
               clone_from = UR(temp_len - clone_len + 1);
 
             } else {
 
-              clone_len = choose_block_len(HAVOC_BLK_XL);
+              clone_len = choose_block_len(HAVOC_BLK_XL, queue_cur);
               clone_from = 0;
 
             }
@@ -6427,7 +6394,7 @@ havoc_stage:
 
             if (temp_len < 2) break;
 
-            copy_len  = choose_block_len(temp_len - 1);
+            copy_len  = choose_block_len(temp_len - 1, queue_cur);
 
             copy_from = UR(temp_len - copy_len + 1);
             copy_to   = UR(temp_len - copy_len + 1);
@@ -6694,6 +6661,7 @@ abandon_entry:
 #undef FLIP_BIT
 
 }
+
 
 
 /* Grab interesting test cases from other fuzzers. */
@@ -8048,7 +8016,7 @@ int main(int argc, char** argv) {
 
   setup_post();
   setup_shm();
-  fams_global_init();
+  flp_global_init();
   init_count_class16();
 
   setup_dirs_fds();
@@ -8126,7 +8094,8 @@ int main(int argc, char** argv) {
 
       if (queued_paths == prev_queued) {
 
-        if (use_splicing) cycles_wo_finds++; else use_splicing = 1;
+        if (use_splicing) cycles_wo_finds++; 
+        else use_splicing = 1;
 
       } else cycles_wo_finds = 0;
 

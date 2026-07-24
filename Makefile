@@ -3,13 +3,13 @@
 # -----------------------------
 #
 # Written and maintained by Michal Zalewski <lcamtuf@google.com>
-# 
+#
 # Copyright 2013, 2014, 2015, 2016, 2017 Google LLC All rights reserved.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-# 
+#
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
 
@@ -23,14 +23,13 @@ DOC_PATH    = $(PREFIX)/share/doc/afl
 MISC_PATH   = $(PREFIX)/share/afl
 
 # PROGS intentionally omit afl-as, which gets installed elsewhere.
-
 PROGS       = afl-gcc afl-fuzz afl-showmap afl-tmin afl-gotcpu afl-analyze
 SH_PROGS    = afl-plot afl-cmin afl-whatsup
 
 CFLAGS     ?= -O3 -funroll-loops
 CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
-	      -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
-	      -DBIN_PATH=\"$(BIN_PATH)\"
+              -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
+              -DBIN_PATH=\"$(BIN_PATH)\"
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
   LDFLAGS  += -ldl
@@ -43,6 +42,7 @@ else
 endif
 
 COMM_HDR    = alloc-inl.h config.h debug.h types.h
+FLP_HDR    = flp.h
 
 all: test_x86 $(PROGS) afl-as test_build all_done
 
@@ -69,8 +69,8 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	ln -sf afl-as as
 
-afl-fuzz: afl-fuzz.c fams.c $(COMM_HDR) fams.h | test_x86
-	$(CC) $(CFLAGS) afl-fuzz.c fams.c -o afl-fuzz $(LDFLAGS)
+afl-fuzz: afl-fuzz.c flp.c $(COMM_HDR) $(FLP_HDR) | test_x86
+	$(CC) $(CFLAGS) afl-fuzz.c flp.c -o afl-fuzz $(LDFLAGS) -lm
 
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
