@@ -894,9 +894,7 @@ void flp_on_new_seed(struct queue_entry* q, u8* trace_bits,u64 total_execs) {
   flp_compute_seed_score(q, trace_bits, total_execs);
 }
 
-static double flp_seed_penalty(struct queue_entry* q,
-                                u64                 avg_exec_us,
-                                u32                 avg_len) {
+static double flp_seed_penalty(struct queue_entry* q, u64 avg_exec_us, u32 avg_len) {
 
   double mult = 1.0;
   double norm_score;
@@ -945,11 +943,7 @@ static double flp_seed_penalty(struct queue_entry* q,
   return mult;
 }
 
-u32 flp_apply_perf_score(struct queue_entry* q,
-                          u32  base_perf_score,
-                          u64  total_execs,
-                          u64  avg_exec_us,
-                          u32  avg_len) {
+u32 flp_apply_perf_score(struct queue_entry* q, u32  base_perf_score, u64  total_execs, u64  avg_exec_us, u32  avg_len) {
 
   double frontier, potential, lineage, success, edge_component;
   double penalty, flp_score, soft_boost, mult;
@@ -963,16 +957,22 @@ u32 flp_apply_perf_score(struct queue_entry* q,
     q->flp_frontier_score     *= 0.985;
     q->flp_frontier_potential *= 0.985;
     /* FIX 2: flp_no_lineage 下 lineage 字段不应被触碰 */
-#ifndef FLP_DISABLE_LINEAGE
-    q->flp_lineage_score      *= 0.995;
-#endif
-    q->flp_score_epoch         = flp_global_epoch;
+    #ifndef FLP_DISABLE_LINEAGE
+      q->flp_lineage_score      *= 0.995;
+    #endif
+      q->flp_score_epoch         = flp_global_epoch;
   }
 
   frontier  = q->flp_frontier_score;
   potential = q->flp_frontier_potential;
-  lineage   = q->flp_lineage_score;
-  success   = q->flp_success_credit;
+  
+  #ifdef FLP_DISABLE_LINEAGE
+    lineage = 0.0;
+    success = 0.0;
+  #else
+    lineage = q->flp_lineage_score;
+    success = q->flp_success_credit;
+  #endif
 
   if (frontier  < 0.0 || isnan(frontier)  || isinf(frontier))  frontier  = 0.0;
   if (potential < 0.0 || isnan(potential) || isinf(potential)) potential = 0.0;
