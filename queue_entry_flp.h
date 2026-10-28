@@ -57,6 +57,7 @@ struct queue_entry {
 
   double flp_lineage_score;
   double flp_success_credit;
+  u8 flp_lineage_rewarded;
 
   /* scheduler */
 
