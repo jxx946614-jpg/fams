@@ -1422,11 +1422,7 @@ static void cull_queue(void) {
   /* ── Phase 2: FLP Top-K favored override ─────────────────────── */
 
   if (flp_enabled) {
-
-#if FLP_USE_TOPK
-    flp_preserve_topk();
-#endif
-
+    flp_preserve_topk(queue, queued_paths, queue_cycle);
     /* Recount favored after Top-K may have promoted additional seeds. */
     queued_favored  = 0;
     pending_favored = 0;
@@ -4780,7 +4776,7 @@ static u32 calculate_score(struct queue_entry* q) {
 
   if (flp_enabled) {
 
-    double flp_mult = flp_apply_perf_score(q, (u32)base, total_execs, avg_exec_us, q->len);
+    base = flp_apply_perf_score(q, (u32)base, total_execs, avg_exec_us, q->len);
   }
 
   if (base < 1.0)
